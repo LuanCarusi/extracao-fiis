@@ -40,25 +40,6 @@ def get_fundamentus_data():
     for col in cols_to_convert:
         df[col] = parse_percentage(df[col])
         
-    # Aplicar correção manual de segmentos se o arquivo existir
-    arquivo_correcao = 'segmentos_corrigidos.csv'
-    if os.path.exists(arquivo_correcao):
-        try:
-            df_correcao = pd.read_csv(arquivo_correcao, sep=';', comment='#')
-            if not df_correcao.empty and 'Ticker' in df_correcao.columns and 'Segmento' in df_correcao.columns:
-                # Limpar espaços em branco acidentais nas pontas
-                df_correcao['Ticker'] = df_correcao['Ticker'].str.strip()
-                df_correcao['Segmento'] = df_correcao['Segmento'].str.strip()
-                
-                # Criar um dicionário de mapeamento {Ticker: Segmento}
-                mapa_segmentos = dict(zip(df_correcao['Ticker'], df_correcao['Segmento']))
-                
-                # Atualizar a coluna Segmento onde o Papel existir no mapa
-                df['Segmento'] = df['Papel'].map(mapa_segmentos).fillna(df['Segmento'])
-                print(f"Substituição de segmentos aplicada usando '{arquivo_correcao}' ({len(mapa_segmentos)} regras encontradas).")
-        except Exception as e:
-            print(f"Aviso: Não foi possível aplicar correções de segmento: {e}")
-            
     return df
 
 def apply_filters(df, min_liquidity, max_vacancy, min_pvp, min_dy):
@@ -146,6 +127,31 @@ def main():
     colunas_mantidas = ['Papel', 'Segmento', 'Cotacao', 'FFO_Yield', 'Dividend_Yield', 
                         'P_VP', 'Valor_de_Mercado', 'Liquidez', 'Qtd_de_imoveis', 'Vacancia_Media']
     df = df_raw[colunas_mantidas].copy()
+
+    # Aplicar correção manual de segmentos APÓS seleção de colunas
+    arquivo_correcao = 'segmentos_corrigidos.csv'
+    if os.path.exists(arquivo_correcao):
+        try:
+            df_correcao = pd.read_csv(arquivo_correcao, sep=';', comment='#', usecols=['Ticker', 'Segmento'])
+            if not df_correcao.empty:
+                # Normalizar: remover espaços e padronizar caixa
+                df_correcao['Ticker'] = df_correcao['Ticker'].astype(str).str.strip().str.upper()
+                df_correcao['Segmento'] = df_correcao['Segmento'].astype(str).str.strip()
+                # Remover linhas inválidas após limpeza
+                df_correcao = df_correcao[df_correcao['Ticker'].str.match(r'^[A-Z]{4}\d{2}$')]
+
+                # Criar dicionário de mapeamento {Ticker: Segmento}
+                mapa_segmentos = dict(zip(df_correcao['Ticker'], df_correcao['Segmento']))
+
+                # Normalizar a coluna Papel para garantir matching correto
+                papel_normalizado = df['Papel'].astype(str).str.strip().str.upper()
+                segmento_corrigido = papel_normalizado.map(mapa_segmentos)
+
+                # Aplicar apenas onde há correção definida
+                df['Segmento'] = segmento_corrigido.combine_first(df['Segmento'])
+                print(f"Correção de segmentos aplicada: '{arquivo_correcao}' ({len(mapa_segmentos)} regras).")
+        except Exception as e:
+            print(f"Aviso: Não foi possível aplicar correções de segmento: {e}")
     
     # 2. Filtragem
     df_filtered = apply_filters(df, args.liquidez, args.vacancia, args.pvp, min_dy)
