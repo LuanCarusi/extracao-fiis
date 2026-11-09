@@ -4,6 +4,20 @@ import os
 import json
 from pathlib import Path
 from dotenv import load_dotenv
+import requests as _requests
+
+def fetch_ipca_12m():
+    """Busca o IPCA acumulado dos últimos 12 meses via API do Banco Central (BCB série 13522)."""
+    try:
+        url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json"
+        resp = _requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return float(data[-1]['valor'].replace(',', '.')), None
+        return None, "Sem dados retornados pela API do BCB."
+    except Exception as e:
+        return None, str(e)
 from ai_formatter import parse_analysis_markdown, render_ai_dashboard, highlight_sources, get_ai_formatter_css
 
 load_dotenv()
@@ -99,20 +113,61 @@ st.markdown("Filtro, ranking e analise profunda de FIIs com suporte a Inteligenc
 # SIDEBAR GLOBAL
 # ============================================================
 st.sidebar.markdown('<div class="header-box">ATUALIZAR DADOS</div>', unsafe_allow_html=True)
-ipca_rate_input = st.sidebar.number_input("Taxa IPCA+ Atual (%)", value=6.00, step=0.1, help="Utilizada para calcular o corte minimo de Dividend Yield.")
 
-def rodar_screening(ipca_rate):
-    import subprocess
+ipca_plus_input = st.sidebar.number_input(
+    "📈 Spread do Tesouro IPCA+ mais curto (%)",
+    value=6.00, step=0.1,
+    help=(
+        "Informe apenas o spread (parte fixa) do Tesouro IPCA+ de menor vencimento disponível. "
+        "Ex.: para IPCA+7,58%, informe 7.58."
+    )
+)
+
+# Busca automática do IPCA acumulado 12m via BCB
+_ipca_val, _ipca_err = fetch_ipca_12m()
+if _ipca_err:
+    st.sidebar.warning(f"⚠️ IPCA automático indisponível. Informe manualmente.")
+    ipca_12m_input = st.sidebar.number_input(
+        "🏦 IPCA acumulado últimos 12 meses (%)",
+        value=4.83, step=0.01,
+        help="Informe o IPCA acumulado dos últimos 12 meses (disponível em bcb.gov.br/estatisticas/mercado-financeiro-e-de-capitais)."
+    )
+else:
+    ipca_12m_input = _ipca_val
+    st.sidebar.success(f"📊 IPCA 12m (BCB): **{_ipca_val:.2f}%** ✔")
+
+# Calcula e exibe o DY mínimo (benchmark real líquido do Tesouro IPCA+ em fator)
+_fator_bruto = (1 + ipca_plus_input / 100) * (1 + ipca_12m_input / 100)
+_fator_liquido = 1 + (_fator_bruto - 1) * 0.85
+_fator_real = _fator_liquido / (1 + ipca_12m_input / 100)
+_min_dy = (_fator_real - 1) * 100
+st.sidebar.info(f"🎯 DY mínimo (filtro): **{_min_dy:.2f}%**")
+
+def rodar_screening(ipca_plus, ipca_12m):
+    import subprocess, sys
     try:
-        subprocess.run(["python", "screening_fiis.py", "--ipca-rate", str(ipca_rate)], check=True)
+        result = subprocess.run(
+            [sys.executable, "screening_fiis.py",
+             "--ipca-plus-rate", str(ipca_plus),
+             "--ipca-12m", str(ipca_12m)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout:
+            st.sidebar.code(result.stdout, language=None)
         return True
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip() if e.stderr else "(sem detalhes)"
+        st.sidebar.error(f"Erro ao executar script (código {e.returncode}):\n\n```\n{stderr}\n```")
+        return False
     except Exception as e:
-        st.sidebar.error(f"Erro ao executar script: {e}")
+        st.sidebar.error(f"Erro inesperado: {e}")
         return False
 
 if st.sidebar.button("🔄 Atualizar Ranking Agora", use_container_width=True):
     with st.spinner("Extraindo e processando dados..."):
-        if rodar_screening(ipca_rate_input):
+        if rodar_screening(ipca_plus_input, ipca_12m_input):
             st.sidebar.success("Ranking atualizado com sucesso!")
             st.rerun()
 

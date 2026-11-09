@@ -5,11 +5,28 @@ import io
 import os
 from datetime import datetime
 
+def fetch_ipca_12m_bcb():
+    """Busca o IPCA acumulado dos últimos 12 meses via API do Banco Central (BCB série 13522)."""
+    try:
+        url = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.13522/dados/ultimos/1?formato=json"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return float(data[-1]['valor'].replace(',', '.'))
+        raise ValueError("Sem dados retornados pela API do BCB.")
+    except Exception as e:
+        raise RuntimeError(f"Falha ao buscar IPCA do BCB: {e}")
+
 def parse_percentage(col):
-    """Converts a percentage string like '12,34%' to a float 12.34"""
-    if col.dtype == 'object':
-        return col.str.replace('%', '', regex=False).str.replace(',', '.', regex=False).astype(float)
-    return col
+    """Converts a percentage string like '12,34%' to a float 12.34.
+    Compatible with both legacy object dtype and new pandas ArrowDtype strings."""
+    try:
+        cleaned = col.str.replace('%', '', regex=False).str.replace(',', '.', regex=False)
+        return pd.to_numeric(cleaned, errors='coerce')
+    except AttributeError:
+        # Already numeric
+        return pd.to_numeric(col, errors='coerce')
 
 def get_fundamentus_data():
     """Fetches FII data from Fundamentus"""
@@ -45,15 +62,20 @@ def get_fundamentus_data():
 def apply_filters(df, min_liquidity, max_vacancy, min_pvp, min_dy):
     """Applies the screening filters to the DataFrame"""
     print("Aplicando filtros...")
-    
+
+    # Garante que as colunas numéricas estejam no tipo correto antes de filtrar
+    for col in ['Liquidez', 'Vacancia_Media', 'P_VP', 'Dividend_Yield']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
     initial_len = len(df)
     
     # Filter: Liquidez diária >= 500.000
     df = df[df['Liquidez'] >= min_liquidity]
     print(f" - Removidos ativos com Liquidez < {min_liquidity:,.0f} (Restam {len(df)})")
     
-    # Filter: Vacância média <= 30%
-    df = df[df['Vacancia_Media'] <= max_vacancy]
+    # Filter: Vacância média <= max_vacancy (NaN = FII de papel/sem vacância → mantém)
+    df = df[df['Vacancia_Media'].isna() | (df['Vacancia_Media'] <= max_vacancy)]
     print(f" - Removidos ativos com Vacância > {max_vacancy}% (Restam {len(df)})")
     
     # Filter: P/VP >= 0.7
@@ -92,25 +114,49 @@ def apply_ranking(df):
 
 def main():
     parser = argparse.ArgumentParser(description='Screening de Fundos Imobiliários (FIIs)')
-    parser.add_argument('--ipca-rate', type=float, required=True, 
-                        help='Taxa atual do título Tesouro IPCA+ mais curto (ex: 7.58 para IPCA + 7,58%)')
-    parser.add_argument('--spread', type=float, default=1.0, 
-                        help='Spread a ser adicionado à taxa IPCA+ para o corte de Dividend Yield (padrão: 1.0)')
-    parser.add_argument('--liquidez', type=float, default=500000.0, 
-                        help='Liquidez diária mínima (padrão: 500000)')
-    parser.add_argument('--vacancia', type=float, default=30.0, 
-                        help='Vacância média máxima em % (padrão: 30.0)')
-    parser.add_argument('--pvp', type=float, default=0.7, 
-                        help='P/VP mínimo (padrão: 0.7)')
-    parser.add_argument('--output', type=str, default='ranking_fiis.xlsx', 
-                        help='Nome do arquivo de saída Excel (padrão: ranking_fiis.xlsx)')
+    parser.add_argument('--ipca-plus-rate', type=float, required=True,
+                        help='Spread do Tesouro IPCA+ de vencimento mais curto. Ex: 7.58 para IPCA+7.58')
+    parser.add_argument('--ipca-12m', type=float, default=None,
+                        help='IPCA acumulado nos ultimos 12 meses. Se omitido, busca automaticamente do BCB.')
+    parser.add_argument('--liquidez', type=float, default=500000.0,
+                        help='Liquidez diaria minima. Padrao: 500000')
+    parser.add_argument('--vacancia', type=float, default=30.0,
+                        help='Vacancia media maxima em percentual. Padrao: 30.0')
+    parser.add_argument('--pvp', type=float, default=0.7,
+                        help='P/VP minimo. Padrao: 0.7')
+    parser.add_argument('--output', type=str, default='ranking_fiis.xlsx',
+                        help='Nome do arquivo de saida Excel. Padrao: ranking_fiis.xlsx')
     
     args = parser.parse_args()
-    
-    min_dy = args.ipca_rate + args.spread
+
+    # Resolve IPCA 12m: usa arg ou busca automaticamente no BCB
+    if args.ipca_12m is not None:
+        ipca_12m = args.ipca_12m
+        print(f"IPCA 12m fornecido via argumento: {ipca_12m:.2f}%")
+    else:
+        try:
+            ipca_12m = fetch_ipca_12m_bcb()
+            print(f"IPCA 12m obtido automaticamente do BCB: {ipca_12m:.2f}%")
+        except RuntimeError as e:
+            print(f"ERRO: {e}")
+            print("Informe o IPCA 12m manualmente com --ipca-12m.")
+            return
+
+    # Calcula DY mínimo: retorno real líquido do Tesouro IPCA+ após IR (15%) e inflação
+    # Fórmula (tudo em fator):
+    #   fator_bruto  = (1 + spread/100) * (1 + IPCA/100)       → rentabilidade nominal bruta
+    #   fator_liq    = 1 + (fator_bruto - 1) * 0.85            → após IR de 15% sobre o ganho
+    #   fator_real   = fator_liq / (1 + IPCA/100)              → deflaciona pela inflação (em fator)
+    #   DY_mín       = (fator_real - 1) * 100                  → converte para %
+    fator_bruto = (1 + args.ipca_plus_rate / 100) * (1 + ipca_12m / 100)
+    fator_liquido = 1 + (fator_bruto - 1) * 0.85
+    fator_real = fator_liquido / (1 + ipca_12m / 100)
+    min_dy = (fator_real - 1) * 100
+
     print(f"--- Configuração do Screening ---")
-    print(f"Taxa IPCA+ Base: {args.ipca_rate}% | Spread: {args.spread}%")
-    print(f"Corte de Dividend Yield Mínimo: {min_dy}%")
+    print(f"Tesouro IPCA+ spread: {args.ipca_plus_rate}% | IPCA 12m: {ipca_12m:.2f}%")
+    print(f"Fator bruto: {fator_bruto:.6f} -> fator liquido (-IR 15%): {fator_liquido:.6f} -> fator real: {fator_real:.6f}")
+    print(f"Corte de Dividend Yield Mínimo (real líquido): {min_dy:.2f}%")
     print(f"Liquidez Mínima: R$ {args.liquidez:,.2f}")
     print(f"Vacância Máxima: {args.vacancia}%")
     print(f"P/VP Mínimo: {args.pvp}")
